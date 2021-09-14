@@ -6,7 +6,7 @@ EXTRA_DIST = ChangeLog README audisp_tacplus.spec \
 
 audisp_tacplus_SOURCES = audisp-tacplus.c
 audisp_tacplus_CFLAGS = -O
-audisp_tacplus_LDADD = -lauparse -ltacplus_map
+audisp_tacplus_LDADD = -lauparse -ltacsupport -ltac
 sbin_PROGRAMS = audisp-tacplus
 man_MANS = audisp-tacplus.8
 

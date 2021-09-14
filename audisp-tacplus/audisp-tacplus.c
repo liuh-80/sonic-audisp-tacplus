@@ -45,8 +45,10 @@
 
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <pwd.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <inttypes.h>
 #include <signal.h>
 #include <string.h>
@@ -54,10 +56,14 @@
 #include <errno.h>
 #include <libaudit.h>
 #include <auparse.h>
+#include <unistd.h>
+#include <limits.h>
 
 
-#include <tacplus/libtac.h>
-#include <tacplus/map_tacplus_user.h>
+#include <libtac/libtac.h>
+
+/* Tacacs+ support lib */
+#include <libtac/support.h>
 
 #define _VMAJ 1
 #define _VMIN 0
@@ -69,7 +75,14 @@ static volatile int hup = 0;
 static auparse_state_t *au = NULL;
 static unsigned connected_ok;
 
-char *configfile = "/etc/audisp/audisp-tac_plus.conf";
+/* Tacacs control flag */
+int tacacs_ctrl;
+
+/* Uniknown host name */
+const char *unknown_hostname = "UNK";
+
+/* Config file path */
+const char *tacacs_config_file = "/etc/tacplus_servers";
 
 /* Local declarations */
 static void handle_event(auparse_state_t *au,
@@ -93,179 +106,42 @@ hup_handler(int sig __attribute__ ((unused)))
         hup = 1;
 }
 
-typedef struct {
-    struct addrinfo *addr;
-    char *key;
-} tacplus_server_t;
-
-/* set from configuration file parsing */
-static tacplus_server_t tac_srv[TAC_PLUS_MAXSERVERS];
-static int tac_srv_no, tac_key_no;
-static char tac_service[64];
-static char tac_protocol[64];
-static char vrfname[64];
-static int debug = 0;
-static int acct_all; /* send accounting to all servers, not just 1st */
-
 static const char *progname = "audisp-tacplus"; /* for syslogs and errors */
-
-static void
-audisp_tacplus_config(char *cfile, int level)
-{
-    FILE *conf;
-    char lbuf[256];
-
-    conf = fopen(cfile, "r");
-    if(conf == NULL) {
-        syslog(LOG_WARNING, "%s: can't open config file %s: %m",
-            progname, cfile);
-        return;
-    }
-
-    while(fgets(lbuf, sizeof lbuf, conf)) {
-        if(*lbuf == '#' || isspace(*lbuf))
-            continue; /* skip comments, white space lines, etc. */
-        strtok(lbuf, " \t\n\r\f"); /* terminate buffer at first whitespace */
-        if(!strncmp(lbuf, "include=", 8)) {
-            /*
-             * allow include files, useful for centralizing tacacs
-             * server IP address and secret.
-             */
-            if(lbuf[8]) /* else treat as empty config */
-                audisp_tacplus_config(&lbuf[8], level+1);
-        }
-        else if(!strncmp(lbuf, "debug=", 6))
-            debug = strtoul(lbuf+6, NULL, 0);
-        else if(!strncmp(lbuf, "acct_all=", 9))
-            acct_all = strtoul(lbuf+9, NULL, 0);
-        else if(!strncmp(lbuf, "vrf=", 4))
-            tac_xstrcpy(vrfname, lbuf + 4, sizeof(vrfname));
-        else if(!strncmp(lbuf, "service=", 8))
-            tac_xstrcpy(tac_service, lbuf + 8, sizeof(tac_service));
-        else if(!strncmp(lbuf, "protocol=", 9))
-            tac_xstrcpy(tac_protocol, lbuf + 9, sizeof(tac_protocol));
-        else if(!strncmp(lbuf, "login=", 6))
-            tac_xstrcpy(tac_login, lbuf + 6, sizeof(tac_login));
-        else if (!strncmp (lbuf, "timeout=", 8)) {
-            tac_timeout = (int)strtoul(lbuf+8, NULL, 0);
-            if (tac_timeout < 0) /* explict neg values disable poll() use */
-                tac_timeout = 0;
-            else /* poll() only used if timeout is explictly set */
-                tac_readtimeout_enable = 1;
-        }
-        else if(!strncmp(lbuf, "secret=", 7)) {
-            int i;
-            /* no need to complain if too many on this one */
-            if(tac_key_no < TAC_PLUS_MAXSERVERS) {
-                if((tac_srv[tac_key_no].key = strdup(lbuf+7)))
-                    tac_key_no++;
-                else
-                    syslog(LOG_ERR, "%s: unable to copy server secret %s",
-                        __FUNCTION__, lbuf+7);
-            }
-            /* handle case where 'secret=' was given after a 'server='
-             * parameter, fill in the current secret */
-            for(i = tac_srv_no-1; i >= 0; i--) {
-                if (tac_srv[i].key)
-                    continue;
-                tac_srv[i].key = strdup(lbuf+7);
-            }
-        }
-        else if(!strncmp(lbuf, "server=", 7)) {
-            if(tac_srv_no < TAC_PLUS_MAXSERVERS) {
-                struct addrinfo hints, *servers, *server;
-                int rv;
-                char *port, server_buf[sizeof lbuf];
-
-                memset(&hints, 0, sizeof hints);
-                hints.ai_family = AF_UNSPEC;  /* use IPv4 or IPv6, whichever */
-                hints.ai_socktype = SOCK_STREAM;
-
-                strcpy(server_buf, lbuf + 7);
-
-                port = strchr(server_buf, ':');
-                if(port != NULL) {
-                    *port = '\0';
-					port++;
-                }
-                if((rv = getaddrinfo(server_buf, (port == NULL) ?
-                            "49" : port, &hints, &servers)) == 0) {
-                    for(server = servers; server != NULL &&
-                        tac_srv_no < TAC_PLUS_MAXSERVERS;
-                        server = server->ai_next) {
-                        tac_srv[tac_srv_no].addr = server;
-                        /* use current key, if our index not yet set */
-                        if(tac_key_no && !tac_srv[tac_srv_no].key)
-                            tac_srv[tac_srv_no].key =
-                                strdup(tac_srv[tac_key_no-1].key);
-                        tac_srv_no++;
-                    }
-                }
-                else {
-                    syslog(LOG_ERR,
-                        "skip invalid server: %s (getaddrinfo: %s)",
-                        server_buf, gai_strerror(rv));
-                }
-            }
-            else {
-                syslog(LOG_ERR, "maximum number of servers (%d) exceeded, "
-                    "skipping", TAC_PLUS_MAXSERVERS);
-            }
-        }
-        else if(debug) /* ignore unrecognized lines, unless debug on */
-            syslog(LOG_WARNING, "%s: unrecognized parameter: %s",
-                progname, lbuf);
-    }
-
-    if(level == 0 && (!tac_service[0] || tac_srv_no == 0))
-        syslog(LOG_ERR, "%s version %d.%d.%d: missing tacacs fields in file %s, %d servers",
-            progname, _VMAJ, _VMIN, _VPATCH, configfile, tac_srv_no);
-
-    if(debug) {
-        int n;
-        syslog(LOG_NOTICE, "%s version %d.%d.%d tacacs service=%s", progname,
-            _VMAJ, _VMIN, _VPATCH, tac_service);
-
-        for(n = 0; n < tac_srv_no; n++)
-            syslog(LOG_DEBUG, "%s: tacacs server[%d] { addr=%s, key='%s' }",
-                progname, n, tac_ntop(tac_srv[n].addr->ai_addr),
-                tac_srv[n].key);
-    }
-
-    fclose(conf);
-}
-
 
 static void
 reload_config(void)
 {
-    int i, nservers;
-
     hup = 0;
-
-    /*  reset the config variables that we use, freeing memory where needed */
-    nservers = tac_srv_no;
-    tac_srv_no = 0;
-    tac_key_no = 0;
-    vrfname[0] = '\0';
-    tac_service[0] = '\0';
-    tac_protocol[0] = '\0';
-    tac_login[0] = '\0';
-    debug = 0;
-    acct_all = 0;
-    tac_timeout = 0;
-
-    for(i = 0; i < nservers; i++) {
-        if(tac_srv[i].key) {
-            free(tac_srv[i].key);
-            tac_srv[i].key = NULL;
-        }
-        tac_srv[i].addr = NULL;
-    }
 
     connected_ok = 0; /*  reset connected state (for possible vrf) */
 
-    audisp_tacplus_config(configfile, 0);
+    /* load config file: tacacs_config_file */
+    tacacs_ctrl = parse_config_file(tacacs_config_file);
+}
+
+/*
+ * Get user name by UID, and return NULL when not found user name by UID.
+ * The returned username should be free by caller.
+ */
+char *lookup_logname(uid_t auid)
+{
+    struct passwd *pws;
+    pws = getpwuid(auid);
+    if (pws == NULL) {
+        /* Failed to get user information. */
+        return NULL;
+    }
+    
+    int new_buffer_size = strlen(pws->pw_name) + 1;
+    char* username = malloc(new_buffer_size);
+    if (username == NULL) {
+        /* Failed to allocate new buffer. */
+        return NULL;
+    }
+    
+    memset(username, 0, new_buffer_size);
+    strncpy(username, pws->pw_name, new_buffer_size);
+    return username;
 }
 
 int
@@ -273,10 +149,10 @@ main(int argc, char *argv[])
 {
 	char tmp[MAX_AUDIT_MESSAGE_LENGTH+1];
 	struct sigaction sa;
+    
+    /* initialize random seed*/
+    srand(time(NULL));
 
-    /* if there is an argument, it is an alternate configuration file */
-    if(argc > 1)
-        configfile = argv[1];
     reload_config();
 
 	/* Register sighandlers */
@@ -334,7 +210,7 @@ send_acct_msg(int tac_fd, int type, char *user, char *tty, char *host,
     int retval;
     struct areply re;
 
-    attr=(struct tac_attrib *)tac_xcalloc(1, sizeof(struct tac_attrib));
+    attr=(struct tac_attrib *)xcalloc(1, sizeof(struct tac_attrib));
 
     snprintf(buf, sizeof buf, "%lu", (unsigned long)time(NULL));
     tac_add_attrib(&attr, "start_time", buf);
@@ -378,8 +254,7 @@ send_tacacs_acct(char *user, char *tty, char *host, char *cmdmsg, int type,
     int retval, srv_i, srv_fd;
 
     for(srv_i = 0; srv_i < tac_srv_no; srv_i++) {
-        srv_fd = tac_connect_single(tac_srv[srv_i].addr, tac_srv[srv_i].key,
-            NULL, vrfname[0]?vrfname:NULL);
+        srv_fd = tac_connect_single(tac_srv[srv_i].addr, tac_srv[srv_i].key, &tac_source_addr, tac_timeout, __vrfname);
         if(srv_fd < 0) {
             syslog(LOG_WARNING, "connection to %s failed (%d) to send"
                 " accounting record: %m",
@@ -393,8 +268,9 @@ send_tacacs_acct(char *user, char *tty, char *host, char *cmdmsg, int type,
         close(srv_fd);
         if(!retval) {
             connected_ok = 1;
-            if(!acct_all)
+            if(!(tacacs_ctrl & PAM_TAC_ACCT)) {
                 break; /* only send to first responding server */
+            }
         }
     }
 }
@@ -458,9 +334,17 @@ static void get_acct_record(auparse_state_t *au, int type)
     pid_t pid;
     uint16_t taskno;
     unsigned argc=0, session=0, auid;
-    char *auser = NULL, *loguser, *tty = NULL, *host = NULL;
+    char *auser = NULL, *loguser, *tty = NULL;
     char *cmd = NULL, *ausyscall = NULL;
     char logbuf[240], *logptr, *logbase;
+
+    /* get host name. */
+    char host[HOST_NAME_MAX];
+    memset(host, 0, sizeof(host));
+    if (gethostname(host, sizeof(host)) != 0)
+    {
+        strncpy(host, unknown_hostname, sizeof(host));
+    }
 
     if(get_field(au, "syscall"))
         ausyscall = (char *)auparse_interpret_field(au);
@@ -500,8 +384,10 @@ static void get_acct_record(auparse_state_t *au, int type)
         pid = (pid_t)val;
         taskno = (uint16_t) pid;
     }
-    else /* should never happen, if it does, records won't match */
-        taskno = tac_magic();
+    else {
+        /* should never happen, if it does, records won't match */
+        taskno = (u_int32_t)rand();
+    }
 
     if(get_field(au, "auid")) {
         auser = (char *)auparse_interpret_field(au);
@@ -520,7 +406,7 @@ static void get_acct_record(auparse_state_t *au, int type)
      * the NSS library, the username in auser will likely already be the login
      * name.
      */
-    loguser = lookup_logname(NULL, auid, session, &host, NULL);
+    loguser = lookup_logname(auid);
     if(!loguser) {
         char *user = NULL;
 
@@ -605,13 +491,11 @@ static void get_acct_record(auparse_state_t *au, int type)
      * loguser is always set, we bail if not.  For ANOM_ABEND, tty may be
      *  unknown, and in some cases, host may be not be set.
      */
-    send_tacacs_acct(loguser, tty?tty:"UNK", host?host:"UNK", logbase, acct_type, taskno);
+    send_tacacs_acct(loguser, tty?tty:"UNK", host, logbase, acct_type, taskno);
 
-    if(host)
-        free(host);
-
-    if(freeloguser)
+    if(freeloguser) {
         free(loguser);
+    }
 }
 
 /*
