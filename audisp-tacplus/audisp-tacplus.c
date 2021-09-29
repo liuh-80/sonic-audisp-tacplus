@@ -68,6 +68,9 @@
 /* Remove user secret */
 #include "user_secret.h"
 
+/* Local accounting */
+#include "local_accounting.h"
+
 #define _VMAJ 1
 #define _VMIN 0
 #define _VPATCH 0
@@ -511,7 +514,13 @@ static void get_acct_record(auparse_state_t *au, int type)
      * loguser is always set, we bail if not.  For ANOM_ABEND, tty may be
      *  unknown, and in some cases, host may be not be set.
      */
-    send_tacacs_acct(loguser, tty?tty:"UNK", host, logbase, acct_type, taskno);
+    if (tacacs_ctrl & ACCOUNTING_FLAG_TACACS) {
+        send_tacacs_acct(loguser, tty?tty:"UNK", host, logbase, acct_type, taskno);
+    }
+    
+    if (tacacs_ctrl & ACCOUNTING_FLAG_LOCAL) {
+        accounting_to_syslog(loguser, tty?tty:"UNK", host, logbase, acct_type, taskno);
+    }
 
     if(freeloguser) {
         free(loguser);
