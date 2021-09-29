@@ -65,6 +65,9 @@
 /* Tacacs+ support lib */
 #include <libtac/support.h>
 
+/* Remove user secret */
+#include "user_secret.h"
+
 #define _VMAJ 1
 #define _VMIN 0
 #define _VPATCH 0
@@ -83,6 +86,9 @@ const char *unknown_hostname = "UNK";
 
 /* Config file path */
 const char *tacacs_config_file = "/etc/tacplus_servers";
+
+/* User secret setting file */
+const char *sudoers_path = "/etc/sudoers";
 
 /* Local declarations */
 static void handle_event(auparse_state_t *au,
@@ -170,7 +176,12 @@ main(int argc, char *argv[])
 		syslog(LOG_ERR, "exitting due to auparse init errors");
 		return -1;
 	}
+    
+    /* initialize user secret regex setting */
+    initialize_user_secret_setting(sudoers_path);
+
 	auparse_add_callback(au, handle_event, NULL, NULL);
+
 	do {
 		/* Load configuration */
 		if(hup) {
@@ -197,6 +208,9 @@ main(int argc, char *argv[])
 	/* Flush any accumulated events from queue */
 	auparse_flush_feed(au);
 	auparse_destroy(au);
+
+    /* Release user secret setting */
+    release_user_secret_setting();
 
 	return 0;
 }
@@ -337,6 +351,7 @@ static void get_acct_record(auparse_state_t *au, int type)
     char *auser = NULL, *loguser, *tty = NULL;
     char *cmd = NULL, *ausyscall = NULL;
     char logbuf[240], *logptr, *logbase;
+    char fixed_log_buffer[240];
 
     /* get host name. */
     char host[HOST_NAME_MAX];
@@ -485,6 +500,11 @@ static void get_acct_record(auparse_state_t *au, int type)
         }
         logptr += llen;
         tlen += llen;
+    }
+    
+    /* try remove user secret */
+    if (remove_user_secret(logbase, fixed_log_buffer, sizeof(fixed_log_buffer)) == USER_SECRET_FIXED) {
+        logbase = fixed_log_buffer;
     }
 
     /*

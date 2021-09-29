@@ -1,0 +1,4 @@
+# test file for read user secret setting
+
+Cmnd_Alias      PASSWD_CMDS = /usr/local/bin/config tacacs passkey *, \ 
+                              /usr/sbin/chpasswd *   
